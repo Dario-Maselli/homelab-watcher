@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
 watcher.py
-Git → Docker Compose redeployer with Vault-backed env and async-safe git:
+Git → Docker Compose redeployer with Vault/file env and repo-controlled stacks.
 
-- Project modes:
-  - CLONE  … deploy from an isolated clone under deploy_path
-  - WORKTREE … deploy from a detached git worktree linked to source_repo_path
-- Never switches your dev repo branch… only fetches in the source… resets the deploy copy only
-- Vault KV v2 or file-based env per stack… writes a local cached .env per stack
-- If a stack does not need an env… omit env spec… or set env.optional: true to ignore missing
-- Auto-discovery of compose stacks when not listed
-- Docker readiness wait with backoff… compose retries
-- Discord and email notifications
-- Step logging with LOG_STEPS
+Key behaviors:
+  • Two project modes:
+      CLONE      … deploy from an isolated clone under deploy_path
+      WORKTREE   … deploy from a detached git worktree tied to source_repo_path
+  • Repo-controlled stacks:
+      The watcher will read a stacks file from the deploy copy of the homelab repo.
+      Search order: .homelab/stacks.yaml, .homelab/stacks.yml, stacks.yaml, stacks.yml
+      Override via HOMELAB_STACKS_FILE (absolute or relative to repo root).
+  • Env per stack:
+      backend: vault | file
+      optional: true to ignore missing secret/file
+      materialize: ".env" or "whatever.env" to write next to compose (for env_file:)
+      vault: secret_path, data_key, addr, token
+      file:  path
+  • Docker readiness wait, compose retries with capped attempts and notifications
+  • Discord + email notifications
+  • Step logging with LOG_STEPS
 """
 
 import os, re, sys, time, json, random, socket, traceback, subprocess, smtplib, shutil
@@ -68,17 +75,66 @@ def _split_csv(val: str) -> List[str]:
         return []
     return [p.strip() for p in str(val).split(",") if p and p.strip()]
 
-def send_discord(webhook: str, message: str) -> None:
+def send_discord(webhook: str, message: str, username: str = None) -> None:
     if not webhook:
+        log("Discord webhook not configured", step=True)
         return
-    try:
-        import urllib.request
-        data = json.dumps({"content": message}).encode("utf-8")
-        req = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=10).read()
-        log("Sent Discord notification", step=True)
-    except Exception:
-        pass
+    import urllib.request, urllib.error
+    import time as _time
+
+    def _post_once(payload: dict) -> Tuple[bool, str]:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook,
+            data=data,
+            headers={"Content-Type": "application/json", "User-Agent": "homelab-watcher/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                code = getattr(resp, "status", 204)
+                if 200 <= code < 300:
+                    return True, f"ok {code}"
+                return False, f"non-2xx {code}"
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            return False, f"http {e.code} {body.strip()}"
+        except Exception as e:
+            return False, f"error {type(e).__name__}: {e}"
+
+    msg = str(message or "")
+    maxlen = 1900
+    chunks = [msg[i:i+maxlen] for i in range(0, len(msg), maxlen)] or [""]
+
+    for idx, chunk in enumerate(chunks, 1):
+        payload = {"content": chunk}
+        if username:
+            payload["username"] = username
+        attempts = 0
+        while True:
+            attempts += 1
+            ok, info = _post_once(payload)
+            if ok:
+                log(f"Sent Discord notification ({idx}/{len(chunks)})", step=True)
+                break
+            if "http 429" in info.lower():
+                wait_s = 2.0
+                try:
+                    head = urllib.request.Request(webhook, method="HEAD")
+                    with urllib.request.urlopen(head, timeout=5) as r:
+                        ra = r.headers.get("Retry-After")
+                        if ra:
+                            wait_s = float(ra)
+                except Exception:
+                    pass
+                log(f"Discord 429… sleeping {wait_s}s", step=False)
+                _time.sleep(wait_s)
+            else:
+                if attempts >= 3:
+                    log(f"Discord webhook failed after {attempts} attempts: {info}", step=False)
+                    break
+                backoff = min(2 * attempts, 10)
+                log(f"Discord post failed ({info})… retrying in {backoff}s", step=False)
+                _time.sleep(backoff)
 
 def send_email(cfg: dict, subject: str, body: str) -> None:
     if not cfg or not as_bool(cfg.get("enabled")):
@@ -135,28 +191,50 @@ def compose_up(stack_dir: Path, compose_file: str, env_file: Optional[Path]) -> 
     if env_file and env_file.exists():
         base = f'{base} --env-file "{env_file}"'
         log(f"Using env file: {env_file}", step=True)
+    # validate interpolated config so YAML/env mistakes show up clearly
+    run(f"{base} config -q", cwd=stack_dir)
     log(f"Compose up in {stack_dir} using {compose_file}", step=True)
     run(f"{base} pull --quiet", cwd=stack_dir, check=False)
     run(f"{base} up -d --remove-orphans", cwd=stack_dir)
 
-def compose_up_with_retry(stack_dir: Path, compose_file: str, env_file: Optional[Path], total_timeout: int = 300) -> None:
-    start = time.time()
+def compose_up_with_retry(
+    stack_dir: Path,
+    compose_file: str,
+    env_file: Optional[Path],
+    project_name: str,
+    stack_name: str,
+    discord_webhook: str,
+    email_cfg: dict,
+    max_retries: int = 5,
+) -> None:
     attempt = 0
     while True:
         attempt += 1
         try:
             compose_up(stack_dir, compose_file, env_file)
             return
-        except Exception:
-            if time.time() - start > total_timeout:
+        except Exception as e:
+            log(f"[{project_name}/{stack_name}] compose_up failed on attempt {attempt}… {e}")
+            if attempt >= max_retries:
+                msg = (
+                    f"[{project_name}/{stack_name}] deploy failed after {attempt} attempts on {host()} at {now()}…\n"
+                    f"{e}"
+                )
+                try:
+                    send_discord(discord_webhook, msg[:1900])
+                except Exception:
+                    pass
+                try:
+                    send_email(email_cfg, f"[homelab] {project_name}/{stack_name} deploy failed", msg)
+                except Exception:
+                    pass
                 raise
-            log(f"Retry compose_up attempt {attempt}", step=True)
             time.sleep(min(5 + attempt, 20))
+            log(f"[{project_name}/{stack_name}] retrying compose_up attempt {attempt + 1}", step=True)
 
 # ---------- git helpers
 
 def ensure_clone(repo_url: str, branch: str, deploy_path: Path) -> None:
-    """Keep an isolated clone in deploy_path… never touches your dev checkout."""
     if not deploy_path.exists():
         log(f"Cloning {repo_url} into {deploy_path}")
         deploy_path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,7 +249,6 @@ def ensure_clone(repo_url: str, branch: str, deploy_path: Path) -> None:
             pass
 
 def update_clone_to_origin(branch: str, deploy_path: Path) -> Tuple[str, str]:
-    """Fetch and hard reset the isolated clone to origin/branch."""
     run("git fetch --prune origin", cwd=deploy_path)
     local = run("git rev-parse HEAD", cwd=deploy_path).strip()
     remote = run(f"git rev-parse origin/{branch}", cwd=deploy_path).strip()
@@ -192,16 +269,13 @@ def worktree_exists(source_repo: Path, deploy_path: Path) -> bool:
         pass
     return deploy_path.exists() and (deploy_path / ".git").exists()
 
+def _looks_like_git_url(u: str) -> bool:
+    return str(u).startswith(("git@", "https://", "http://"))
+
 def ensure_worktree(repo_url: str, branch: str, source_repo: Path, deploy_path: Path) -> None:
-    """
-    Create a detached worktree at deploy_path tracking origin/branch…
-    We only git fetch in source_repo… we never checkout or switch your dev branch.
-    """
     if not (source_repo.exists() and (source_repo / ".git").exists()):
         raise SystemExit(f"FATAL: SOURCE_REPO_PATH is not a valid repo: {source_repo}")
-
-    # keep origin accurate if a repo_url was provided
-    if repo_url:
+    if repo_url and _looks_like_git_url(repo_url):
         try:
             current = run("git remote get-url origin", cwd=source_repo).strip()
             if current != repo_url:
@@ -209,17 +283,13 @@ def ensure_worktree(repo_url: str, branch: str, source_repo: Path, deploy_path: 
                 run(f'git remote set-url origin "{repo_url}"', cwd=source_repo)
         except Exception:
             pass
-
     run(f"git fetch origin {branch}", cwd=source_repo)
-
     if not worktree_exists(source_repo, deploy_path):
         log(f"Adding worktree at {deploy_path} -> origin/{branch}")
         deploy_path.parent.mkdir(parents=True, exist_ok=True)
-        # detached worktree at the remote branch tip
         run(f'git worktree add --detach "{deploy_path}" origin/{branch}', cwd=source_repo)
 
 def update_worktree_to_origin(branch: str, deploy_path: Path, source_repo: Path) -> Tuple[str, str]:
-    """Fetch in source repo… then hard reset the worktree to the fetched remote tip… dev repo is never switched."""
     run(f"git fetch origin {branch}", cwd=source_repo)
     local = run("git rev-parse HEAD", cwd=deploy_path).strip()
     remote = run(f"git rev-parse origin/{branch}", cwd=source_repo).strip()
@@ -228,7 +298,7 @@ def update_worktree_to_origin(branch: str, deploy_path: Path, source_repo: Path)
         run(f"git reset --hard {remote}", cwd=deploy_path)
     return local, remote
 
-# ---------- config and discovery
+# ---------- config & discovery
 
 ENV_ONLY_PATTERN = re.compile(r"^\$\{([^}]+)\}$")
 COMPOSE_FILENAMES = ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
@@ -303,6 +373,12 @@ def write_env_cache(project: str, stack: str, content: str) -> Path:
     path.write_text(content, encoding="utf-8")
     return path
 
+def write_materialized_env(stack_dir: Path, filename: str, content: str) -> Path:
+    target = stack_dir / filename
+    target.write_text(content, encoding="utf-8")
+    log(f"Materialized env file at {target}", step=True)
+    return target
+
 def safe_name(x: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", x or "")
 
@@ -315,11 +391,6 @@ def fetch_env_file(path_str: str) -> Optional[str]:
     return None
 
 def vault_kv2_read(secret_path: str, addr: Optional[str], token: Optional[str], timeout: int = 10) -> Dict[str, str]:
-    """
-    Read from Vault KV v2: GET {addr}/v1/<mount>/data/<path>
-    secret_path looks like 'kv/homelab/monitoring'
-    Returns dict from .data.data
-    """
     if not secret_path or "/" not in secret_path:
         raise RuntimeError(f"vault secret_path must look like 'kv/namespace/...' not '{secret_path}'")
     addr = addr or os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200")
@@ -342,7 +413,6 @@ def vault_kv2_read(secret_path: str, addr: Optional[str], token: Optional[str], 
     return {str(k): "" if v is None else str(v) for k, v in data.items()}
 
 def build_env_blob_from_map(kv: Dict[str, str]) -> str:
-    # single key named env means a full .env blob
     if "env" in kv and len(kv) == 1:
         return kv["env"]
     lines = []
@@ -353,21 +423,15 @@ def build_env_blob_from_map(kv: Dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 def get_env_for_stack(project_name: str, stack_name: str, stack_dir: Path, env_spec: Optional[dict]) -> Optional[Path]:
-    """
-    Resolve env for a stack.
-    env_spec:
-      backend: vault | file
-      optional: true to ignore missing secret or file
-      # vault
-      secret_path: kv/homelab/monitoring
-      data_key: env   … optional… if present use only that key as blob
-      addr: override VAULT_ADDR
-      token: override VAULT_TOKEN
-      # file
-      path: relative/or/absolute .env path
-    """
     if not env_spec:
         return None
+
+    def _finish(content: str) -> Path:
+        cache_path = write_env_cache(project_name, stack_name, content)
+        mat_name = env_spec.get("materialize")
+        if mat_name:
+            write_materialized_env(stack_dir, mat_name, content)
+        return cache_path
 
     backend = (env_spec.get("backend") or "file").lower()
     optional = as_bool(env_spec.get("optional", False))
@@ -382,10 +446,10 @@ def get_env_for_stack(project_name: str, stack_name: str, stack_dir: Path, env_s
                 log(f"[{project_name}/{stack_name}] optional env file not found… continuing", step=True)
                 return None
             raise RuntimeError(f"[{project_name}/{stack_name}] env file not found: {p}")
-        return write_env_cache(project_name, stack_name, content)
+        return _finish(content)
 
     if backend == "vault":
-        secret_path = env_spec.get("secret_path", "").strip()
+        secret_path = (env_spec.get("secret_path") or "").strip()
         addr = env_spec.get("addr")
         token = env_spec.get("token")
         try:
@@ -402,12 +466,61 @@ def get_env_for_stack(project_name: str, stack_name: str, stack_dir: Path, env_s
                     log(f"[{project_name}/{stack_name}] optional key '{data_key}' missing… continuing", step=True)
                     return None
                 raise RuntimeError(f"[{project_name}/{stack_name}] vault path {secret_path} missing key '{data_key}'")
-            blob = str(kv[data_key])
-            return write_env_cache(project_name, stack_name, blob)
-        blob = build_env_blob_from_map(kv)
-        return write_env_cache(project_name, stack_name, blob)
+            return _finish(str(kv[data_key]))
+        return _finish(build_env_blob_from_map(kv))
 
     raise RuntimeError(f"[{project_name}/{stack_name}] unsupported env backend: {backend}")
+
+# ---------- repo stacks loader
+
+REPO_STACKS_CANDIDATES = [
+    ".homelab/stacks.yaml",
+    ".homelab/stacks.yml",
+    "stacks.yaml",
+    "stacks.yml",
+]
+
+def find_repo_stacks_file(repo_root: Path) -> Optional[Path]:
+    override = os.environ.get("HOMELAB_STACKS_FILE", "").strip()
+    if override:
+        p = Path(override)
+        if not p.is_absolute():
+            p = repo_root / override
+        if p.exists():
+            return p
+    for rel in REPO_STACKS_CANDIDATES:
+        p = repo_root / rel
+        if p.exists():
+            return p
+    return None
+
+def load_repo_stacks(repo_root: Path) -> Optional[List[dict]]:
+    stacks_path = find_repo_stacks_file(repo_root)
+    if not stacks_path:
+        return None
+    try:
+        data = yaml.safe_load(stacks_path.read_text(encoding="utf-8")) or {}
+        data = interpolate_env(data)
+        stacks = data.get("stacks")
+        if isinstance(stacks, list):
+            # normalize
+            norm: List[dict] = []
+            for s in stacks:
+                if not isinstance(s, dict):
+                    continue
+                d = {
+                    "dir": s.get("dir", "."),
+                    "compose": s.get("compose", ""),
+                    "env": s.get("env"),
+                }
+                norm.append(d)
+            return norm
+        # also allow top-level list
+        if isinstance(data, list):
+            return data
+    except Exception as e:
+        log(f"Failed to load repo stacks file: {e}")
+    return None
 
 # ---------- main
 
@@ -422,7 +535,6 @@ def main():
     env_file = resolve_env_file(cfg_path if cfg_path.exists() else None)
     load_dotenv(dotenv_path=str(env_file))
 
-    # refresh step flag
     global LOG_STEPS
     LOG_STEPS = as_bool(os.environ.get("LOG_STEPS", "false"))
 
@@ -493,7 +605,6 @@ def main():
     send_discord(discord_webhook, f"homelab watcher started on {host()} at {now()}")
 
     while True:
-        # docker readiness
         ready = wait_for_docker(max_wait_seconds=int(os.environ.get("DOCKER_READY_TIMEOUT", 120)))
         if not ready:
             if time.time() - last_docker_warn_ts > 300:
@@ -521,7 +632,7 @@ def main():
                 if not repo_url:
                     raise SystemExit(f"FATAL: project '{name}' has empty repo_url")
 
-                # fetch and compute hashes without touching your dev checkout
+                # sync repo copy
                 if mode == "worktree":
                     if not source_repo_path:
                         raise SystemExit(f"FATAL: project '{name}' mode=worktree requires source_repo_path")
@@ -539,11 +650,15 @@ def main():
                 if needs_deploy:
                     pending[name] = remote or "pending"
 
-                    # discover stacks
-                    stacks_cfg = proj.get("stacks", [])
-                    stacks: List[Tuple[Path, str, Optional[dict]]] = []
-                    if stacks_cfg:
-                        for s in stacks_cfg:
+                    # stacks precedence: repo stacks file → watcher.yaml stacks → auto-discovery
+                    stacks_cfg_repo = load_repo_stacks(deploy_path)
+                    stacks_cfg_yaml = proj.get("stacks", [])
+                    stacks_list: List[Tuple[Path, str, Optional[dict]]] = []
+
+                    chosen = None
+                    if stacks_cfg_repo:
+                        chosen = "repo stacks file"
+                        for s in stacks_cfg_repo:
                             d = deploy_path / s.get("dir", ".")
                             fname = s.get("compose", "")
                             if not fname:
@@ -552,16 +667,40 @@ def main():
                                         fname = c
                                         break
                             if fname and (d / fname).exists():
-                                stacks.append((d, fname, s.get("env")))
+                                stacks_list.append((d, fname, s.get("env")))
+                    elif stacks_cfg_yaml:
+                        chosen = "watcher.yaml stacks"
+                        for s in stacks_cfg_yaml:
+                            d = deploy_path / s.get("dir", ".")
+                            fname = s.get("compose", "")
+                            if not fname:
+                                for c in COMPOSE_FILENAMES:
+                                    if (d / c).exists():
+                                        fname = c
+                                        break
+                            if fname and (d / fname).exists():
+                                stacks_list.append((d, fname, s.get("env")))
                     else:
+                        chosen = "auto-discovery"
                         for d, fname in discover_stacks(deploy_path, max_depth=int(os.environ.get("DISCOVERY_DEPTH", 2))):
-                            stacks.append((d, fname, None))
+                            stacks_list.append((d, fname, None))
 
-                    if stacks:
-                        for d, fname, env_spec in stacks:
+                    log(f"[{name}] using {chosen}", step=True)
+
+                    if stacks_list:
+                        for d, fname, env_spec in stacks_list:
                             log(f"[{name}] stack: {d} / {fname}", step=True)
                             env_path = get_env_for_stack(name, d.name or "stack", d, env_spec) if env_spec else None
-                            compose_up_with_retry(d, fname, env_path, total_timeout=int(os.environ.get("COMPOSE_TIMEOUT", 300)))
+                            compose_up_with_retry(
+                                d,
+                                fname,
+                                env_path,
+                                project_name=name,
+                                stack_name=d.name or "stack",
+                                discord_webhook=discord_webhook,
+                                email_cfg=email_cfg,
+                                max_retries=5,
+                            )
                     else:
                         log(f"[{name}] no compose stacks found under {deploy_path}… skipping deploy")
 
