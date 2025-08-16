@@ -1,0 +1,65 @@
+# How often to poll for new commits
+poll_interval_seconds: 30
+log_steps: true
+
+notify:
+  discord_webhook: ${DISCORD_WEBHOOK}
+  email:
+    enabled: ${EMAIL_ENABLED}
+    smtp_host: ${EMAIL_SMTP_HOST}
+    smtp_port: ${EMAIL_SMTP_PORT}
+    username: ${EMAIL_USERNAME}
+    password: ${EMAIL_PASSWORD}
+    from: ${EMAIL_FROM}
+    to: ${EMAIL_TO}
+
+projects:
+  - name: homelab
+    mode: worktree                      # clone | worktree
+    repo_url: ${REPO_URL}
+    branch: ${BRANCH}
+    source_repo_path: ${SOURCE_REPO_PATH}   # your dev repo… never switched
+    deploy_path: ${DEPLOY_PATH}             # detached worktree lives here
+
+    stacks:
+      - dir: all_the_rrs
+        compose: docker-compose.yml
+
+      - dir: automation
+        compose: docker-compose.yml
+
+      - dir: authentication
+        compose: docker-compose.yml
+        env:
+          backend: vault
+          secret_path: kv/homelab/authentication
+          data_key: env
+          optional: true
+
+      - dir: core
+        compose: docker-compose.yaml
+        # If core doesn’t need env… omit env entirely or keep optional: true
+        env:
+          backend: vault
+          secret_path: kv/homelab/core
+          data_key: env
+          optional: true
+
+      - dir: databases
+        compose: docker-compose.yml
+        env:
+          backend: vault
+          secret_path: kv/homelab/databases
+          data_key: env
+          optional: true
+
+      - dir: media
+        compose: docker-compose.yaml
+
+      - dir: monitoring
+        compose: docker-compose.yml
+        env:
+          backend: vault
+          secret_path: kv/homelab/monitoring
+          data_key: env
+          optional: true
