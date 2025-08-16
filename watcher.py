@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """
 watcher.py
-Git → Docker Compose redeployer with Vault/file env and repo-controlled stacks.
+Git → Docker Compose redeployer with Vault/file env, repo-controlled stacks,
+stateful removals, and Windows-friendly paths.
 
 Key behaviors:
   • Two project modes:
       CLONE      … deploy from an isolated clone under deploy_path
       WORKTREE   … deploy from a detached git worktree tied to source_repo_path
   • Repo-controlled stacks:
-      The watcher will read a stacks file from the deploy copy of the homelab repo.
+      The watcher reads a stacks file from the deploy copy of the homelab repo.
       Search order: .homelab/stacks.yaml, .homelab/stacks.yml, stacks.yaml, stacks.yml
       Override via HOMELAB_STACKS_FILE (absolute or relative to repo root).
-  • Env per stack:
+  • Env per stack (optional):
       backend: vault | file
       optional: true to ignore missing secret/file
-      materialize: ".env" or "whatever.env" to write next to compose (for env_file:)
+      materialize: ".env" (or any filename) to write next to compose (for env_file:)
       vault: secret_path, data_key, addr, token
       file:  path
-  • Docker readiness wait, compose retries with capped attempts and notifications
-  • Discord + email notifications
+  • Vault-aware:
+      - waits if required Vault secrets are needed and Vault is sealed/unready
+      - optional secrets are skipped while sealed (no spam)
+      - optional local auto-unseal via VAULT_UNSEAL_KEY (self-hosted convenience)
+  • Stateful cleanups:
+      - persists "desired stacks" per project
+      - when a stack disappears from desired state, runs `compose down` to remove it
+  • Docker readiness wait, compose retries (max 5) with final notifications
+  • Discord + email notifications with basic retry and 429 handling
   • Step logging with LOG_STEPS
 """
 
@@ -361,6 +369,28 @@ def resolve_env_file(cfg_path: Optional[Path]) -> Path:
         return c
     return default_base_dir() / ".env"
 
+# ---------- compose file resolution (forgiving)
+
+def resolve_compose_file(dir_path: Path, fname_hint: Optional[str]) -> Optional[str]:
+    # if a hint is given… use it if it exists
+    if fname_hint:
+        p = dir_path / fname_hint
+        if p.exists():
+            return fname_hint
+        # try common alternates if hint is wrong (yml vs yaml etc.)
+        for alt in COMPOSE_FILENAMES:
+            if (dir_path / alt).exists():
+                log(f"[resolve] compose '{fname_hint}' not found in {dir_path}… using '{alt}'", step=True)
+                return alt
+        log(f"[resolve] no compose file found in {dir_path} for hint '{fname_hint}'… skipping", step=True)
+        return None
+    # no hint… auto-discover
+    for c in COMPOSE_FILENAMES:
+        if (dir_path / c).exists():
+            return c
+    log(f"[resolve] no compose file found in {dir_path}… skipping", step=True)
+    return None
+
 # ---------- env backends
 
 def _env_cache_root() -> Path:
@@ -392,7 +422,7 @@ def fetch_env_file(path_str: str) -> Optional[str]:
 
 def vault_kv2_read(secret_path: str, addr: Optional[str], token: Optional[str], timeout: int = 10) -> Dict[str, str]:
     if not secret_path or "/" not in secret_path:
-        raise RuntimeError(f"vault secret_path must look like 'kv/namespace/...' not '{secret_path}'")
+        raise RuntimeError(f"vault secret_path must look like 'kv/namespace/…' not '{secret_path}'")
     addr = addr or os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200")
     token = token or os.environ.get("VAULT_TOKEN", "")
     mount, rel = secret_path.split("/", 1)
@@ -471,6 +501,173 @@ def get_env_for_stack(project_name: str, stack_name: str, stack_dir: Path, env_s
 
     raise RuntimeError(f"[{project_name}/{stack_name}] unsupported env backend: {backend}")
 
+# ---------- Vault health / optional auto-unseal
+
+class VaultSealedError(RuntimeError): pass
+
+def _vault_addr() -> str:
+    return os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200").rstrip("/")
+
+def vault_health(timeout: int = 5) -> dict:
+    import urllib.request, urllib.error, json as _json
+    url = f"{_vault_addr()}/v1/sys/health"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+            data = _json.loads(body) if body else {}
+            return data if isinstance(data, dict) else {}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        try:
+            return json.loads(body) if body else {"sealed": True}
+        except Exception:
+            return {"sealed": True}
+    except Exception:
+        return {}
+
+def vault_try_unseal(unseal_key: str, timeout: int = 5) -> bool:
+    if not unseal_key:
+        return False
+    import urllib.request, urllib.error
+    url = f"{_vault_addr()}/v1/sys/unseal"
+    payload = json.dumps({"key": unseal_key}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8","ignore")
+            data = json.loads(body) if body else {}
+            return bool(data and data.get("sealed") is False)
+    except Exception:
+        return False
+
+def wait_for_vault_if_required(stacks_cfg: list, discord_webhook: str, email_cfg: dict) -> bool:
+    """
+    Returns True when:
+      - no vault-backed stacks require secrets, or
+      - Vault becomes ready (sealed=false, initialized=true, standby or active)
+    Returns False if Vault stayed sealed/unavailable after waiting.
+    Behavior:
+      - If any stack has env.backend == 'vault' and optional != true, we wait.
+      - If VAULT_UNSEAL_KEY is set and Vault is sealed, we attempt an unseal once per cycle.
+      - Wait window controlled by VAULT_WAIT_TIMEOUT (default 120s).
+    """
+    need_vault = False
+    for s in stacks_cfg or []:
+        env = (s.get("env") or {})
+        if str(env.get("backend","")).lower() == "vault" and not as_bool(env.get("optional", False)):
+            need_vault = True
+            break
+    if not need_vault:
+        return True
+
+    total = int(os.environ.get("VAULT_WAIT_TIMEOUT", "120"))
+    start = time.time()
+    warned = False
+    unseal_tried = False
+    while time.time() - start < total:
+        h = vault_health()
+        sealed = bool(h.get("sealed", False))
+        initialized = h.get("initialized", True)
+        if initialized and not sealed:
+            if warned:
+                msg = f"Vault is ready on {host()} at {now()}"
+                log(msg)
+                try: send_discord(discord_webhook, msg)
+                except Exception: pass
+                try: send_email(email_cfg, "[homelab] vault ready", msg)
+                except Exception: pass
+            return True
+        if not warned:
+            msg = f"Vault is not ready (sealed={sealed}, initialized={initialized})… waiting"
+            log(msg)
+            try: send_discord(discord_webhook, msg)
+            except Exception: pass
+            warned = True
+        if sealed and not unseal_tried:
+            key = os.environ.get("VAULT_UNSEAL_KEY", "")
+            if key:
+                if vault_try_unseal(key):
+                    log("Attempted auto-unseal… success", step=True)
+                    time.sleep(1.0)
+                    continue
+                else:
+                    log("Attempted auto-unseal… failed", step=True)
+                unseal_tried = True
+        time.sleep(3.0)
+
+    msg = f"Vault still not ready after {int(time.time()-start)}s… skipping deploy cycle for vault-required stacks"
+    log(msg)
+    try: send_discord(discord_webhook, msg)
+    except Exception: pass
+    try: send_email(email_cfg, "[homelab] vault not ready", msg)
+    except Exception: pass
+    return False
+
+# ---------- deployment state (persist previous stacks)
+
+def _state_root() -> Path:
+    p = default_base_dir() / "state"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _state_file_for(project: str) -> Path:
+    return _state_root() / f"{safe_name(project)}_stacks.json"
+
+def _norm_key(stack_dir: Path, compose_file: str) -> str:
+    return str((stack_dir.resolve() / compose_file).as_posix()).lower()
+
+def _parse_env_for_project_name(env_path: Optional[Path], default_name: str) -> str:
+    try:
+        if env_path and env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if not line or line.strip().startswith("#"):
+                    continue
+                if line.startswith("COMPOSE_PROJECT_NAME="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return default_name
+
+def load_prev_stacks_state(project: str) -> Dict[str, dict]:
+    sf = _state_file_for(project)
+    if not sf.exists():
+        return {}
+    try:
+        data = json.loads(sf.read_text(encoding="utf-8"))
+        return {k: v for k, v in data.items() if isinstance(v, dict)}
+    except Exception:
+        return {}
+
+def save_current_stacks_state(project: str, items: List[dict]) -> None:
+    out = {}
+    for it in items:
+        key = _norm_key(Path(it["dir"]), it["compose"])
+        out[key] = it
+    _state_file_for(project).write_text(json.dumps(out, indent=2), encoding="utf-8")
+
+def compose_down(
+    stack_dir: Path,
+    compose_file: str,
+    project_name: Optional[str],
+    env_file: Optional[Path] = None,
+    remove_volumes: bool = False,
+) -> None:
+    cli = docker_cli_name()
+    base = f'{cli} -f "{compose_file}"'
+    if project_name:
+        base = f'{base} -p "{project_name}"'
+    elif env_file and env_file.exists():
+        base = f'{base} --env-file "{env_file}"'
+    cmd = f"{base} down --remove-orphans"
+    if remove_volumes:
+        cmd = f"{cmd} -v"
+    log(f"Compose down in {stack_dir} for project '{project_name or stack_dir.name}'", step=True)
+    run(cmd, cwd=stack_dir)
+
 # ---------- repo stacks loader
 
 REPO_STACKS_CANDIDATES = [
@@ -503,19 +700,17 @@ def load_repo_stacks(repo_root: Path) -> Optional[List[dict]]:
         data = interpolate_env(data)
         stacks = data.get("stacks")
         if isinstance(stacks, list):
-            # normalize
             norm: List[dict] = []
             for s in stacks:
                 if not isinstance(s, dict):
                     continue
-                d = {
+                norm.append({
                     "dir": s.get("dir", "."),
                     "compose": s.get("compose", ""),
                     "env": s.get("env"),
-                }
-                norm.append(d)
+                    "project_name": s.get("project_name"),
+                })
             return norm
-        # also allow top-level list
         if isinstance(data, list):
             return data
     except Exception as e:
@@ -650,35 +845,29 @@ def main():
                 if needs_deploy:
                     pending[name] = remote or "pending"
 
-                    # stacks precedence: repo stacks file → watcher.yaml stacks → auto-discovery
+                    # choose stacks source: repo file → watcher.yaml → auto
                     stacks_cfg_repo = load_repo_stacks(deploy_path)
                     stacks_cfg_yaml = proj.get("stacks", [])
-                    stacks_list: List[Tuple[Path, str, Optional[dict]]] = []
 
+                    stacks_list: List[Tuple[Path, str, Optional[dict]]] = []
                     chosen = None
                     if stacks_cfg_repo:
                         chosen = "repo stacks file"
                         for s in stacks_cfg_repo:
                             d = deploy_path / s.get("dir", ".")
-                            fname = s.get("compose", "")
-                            if not fname:
-                                for c in COMPOSE_FILENAMES:
-                                    if (d / c).exists():
-                                        fname = c
-                                        break
-                            if fname and (d / fname).exists():
-                                stacks_list.append((d, fname, s.get("env")))
+                            fname = resolve_compose_file(d, s.get("compose", ""))
+                            if fname:
+                                env_spec = s.get("env") or {}
+                                if s.get("project_name"):
+                                    env_spec = dict(env_spec)
+                                    env_spec["project_name"] = s["project_name"]
+                                stacks_list.append((d, fname, env_spec or None))
                     elif stacks_cfg_yaml:
                         chosen = "watcher.yaml stacks"
                         for s in stacks_cfg_yaml:
                             d = deploy_path / s.get("dir", ".")
-                            fname = s.get("compose", "")
-                            if not fname:
-                                for c in COMPOSE_FILENAMES:
-                                    if (d / c).exists():
-                                        fname = c
-                                        break
-                            if fname and (d / fname).exists():
+                            fname = resolve_compose_file(d, s.get("compose", ""))
+                            if fname:
                                 stacks_list.append((d, fname, s.get("env")))
                     else:
                         chosen = "auto-discovery"
@@ -687,14 +876,91 @@ def main():
 
                     log(f"[{name}] using {chosen}", step=True)
 
-                    if stacks_list:
+                    # If any required Vault env is needed, wait (and try auto-unseal if configured)
+                    probe_cfg = [{"env": env_spec or {}} for _, _, env_spec in stacks_list]
+                    if not wait_for_vault_if_required(probe_cfg, discord_webhook, email_cfg):
+                        # Skip this cycle entirely if a required vault secret cannot be read yet
+                        last_seen[name] = remote or local
+                        pending.pop(name, None)
+                        continue
+
+                    # Build desired_items (also resolve env; optional vault env skipped when sealed)
+                    desired_items: List[dict] = []
+                    h = vault_health()
+                    sealed_now = bool(h.get("sealed", False))
+
+                    for d, fname, env_spec in stacks_list:
+                        env_cache = None
+                        mat_name = None
+                        explicit_pn = None
+
+                        if isinstance(env_spec, dict):
+                            explicit_pn = env_spec.get("project_name") or None
+                            if str(env_spec.get("backend","")).lower() == "vault" and sealed_now and as_bool(env_spec.get("optional", False)):
+                                log(f"[{name}/{d.name}] vault is sealed and env is optional… skipping env fetch this cycle", step=True)
+                            else:
+                                try:
+                                    env_cache = get_env_for_stack(name, d.name or "stack", d, env_spec)
+                                    mat_name = env_spec.get("materialize")
+                                except Exception as e:
+                                    if str(env_spec.get("backend","")).lower() == "vault" and "Vault is sealed" in str(e):
+                                        raise VaultSealedError("vault is sealed") from e
+                                    if not as_bool(env_spec.get("optional", False)):
+                                        raise
+                                    log(f"[{name}/{d.name}] optional env fetch failed… {e}", step=True)
+
+                        proj_name_eff = explicit_pn or _parse_env_for_project_name(env_cache, d.name)
+                        desired_items.append({
+                            "dir": str(d.resolve()),
+                            "compose": fname,
+                            "project_name": proj_name_eff,
+                            "env_cache": str(env_cache) if env_cache else None,
+                            "materialized_name": mat_name,
+                        })
+
+                    # Load previous, compute removals BEFORE new ups
+                    prev = load_prev_stacks_state(name)
+                    prev_keys = set(prev.keys())
+                    curr_keys = set(_norm_key(Path(it["dir"]), it["compose"]) for it in desired_items)
+                    removed_keys = prev_keys - curr_keys
+
+                    if removed_keys:
+                        log(f"[{name}] stacks removed since last deploy: {len(removed_keys)}", step=True)
+                        remove_vols = as_bool(os.environ.get("DOWN_REMOVE_VOLUMES", "false"))
+                        for k in sorted(removed_keys):
+                            it = prev[k]
+                            try:
+                                compose_down(
+                                    stack_dir=Path(it["dir"]),
+                                    compose_file=it["compose"],
+                                    project_name=it.get("project_name"),
+                                    env_file=Path(it["env_cache"]) if it.get("env_cache") else None,
+                                    remove_volumes=remove_vols,
+                                )
+                                send_discord(discord_webhook, f"[{name}] removed stack {it['dir']} ({it['compose']}) on {host()} at {now()}")
+                            except Exception as e:
+                                msg = f"[{name}] failed to remove old stack {it['dir']} ({it['compose']}): {e}"
+                                log(msg)
+                                try: send_discord(discord_webhook, msg[:1900])
+                                except Exception: pass
+                                try: send_email(email_cfg, f"[homelab] {name} remove old stack failed", msg)
+                                except Exception: pass
+
+                    # Deploy current desired
+                    if desired_items:
                         for d, fname, env_spec in stacks_list:
                             log(f"[{name}] stack: {d} / {fname}", step=True)
-                            env_path = get_env_for_stack(name, d.name or "stack", d, env_spec) if env_spec else None
+                            # Find the env_cache we already computed for that stack to avoid re-fetch
+                            key = _norm_key(d, fname)
+                            env_cache = None
+                            for it in desired_items:
+                                if _norm_key(Path(it["dir"]), it["compose"]) == key:
+                                    env_cache = Path(it["env_cache"]) if it.get("env_cache") else None
+                                    break
                             compose_up_with_retry(
                                 d,
                                 fname,
-                                env_path,
+                                env_cache,
                                 project_name=name,
                                 stack_name=d.name or "stack",
                                 discord_webhook=discord_webhook,
@@ -708,6 +974,10 @@ def main():
                     log(msg)
                     send_discord(discord_webhook, msg)
                     send_email(email_cfg, f"[homelab] {name} updated", msg)
+
+                    # Persist desired state AFTER successful cycle
+                    save_current_stacks_state(name, desired_items)
+
                     last_seen[name] = remote or local
                     pending.pop(name, None)
                 else:

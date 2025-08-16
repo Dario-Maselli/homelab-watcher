@@ -21,13 +21,8 @@ projects:
     source_repo_path: ${SOURCE_REPO_PATH}   # your dev repo… never switched
     deploy_path: ${DEPLOY_PATH}             # detached worktree lives here
 
+    # Fallback to use watcher.yaml stacks if not defined in homelab repo
     stacks:
-      - dir: all_the_rrs
-        compose: docker-compose.yml
-
-      - dir: automation
-        compose: docker-compose.yml
-
       - dir: authentication
         compose: docker-compose.yml
         # If authentication (or any other stack) doesn’t need env… omit env entirely or keep optional: true
@@ -39,18 +34,6 @@ projects:
           materialize: ".env"
 
       - dir: core
-        compose: docker-compose.yaml
-
-      - dir: databases
-        compose: docker-compose.yml
-        env:
-          backend: vault
-          secret_path: kv/homelab/databases
-          data_key: env
-          optional: true
-          materialize: ".env"
-
-      - dir: media
         compose: docker-compose.yaml
 
       - dir: monitoring
