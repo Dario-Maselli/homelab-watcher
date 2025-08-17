@@ -2,6 +2,7 @@
 Git → Docker Compose redeployer for your homelab… with Vault secrets… repo-controlled stacks… Windows friendly… self-healing retries… and clear notifications
 
 <p align="left"> <a href="#"><img alt="Python" src="https://img.shields.io/badge/Python-3.13.5%2B-blue"></a> <a href="#"><img alt="OS" src="https://img.shields.io/badge/OS-Windows%20%7C%20Linux%20%7C%20macOS-informational"></a> <a href="#"><img alt="Docker" src="https://img.shields.io/badge/Docker-Compose-brightgreen"></a> <a href="#"><img alt="Vault" src="https://img.shields.io/badge/Secrets-HashiCorp%20Vault-7c3aed"></a> </p>
+
 ---
 
 ## ✨ What it does
@@ -152,7 +153,7 @@ VAULT_WAIT_TIMEOUT=120
 DOWN_REMOVE_VOLUMES=false
 
 # Git
-REPO_URL=git@github.com:Dario-Maselli/homelab.git
+REPO_URL=https://github.com/Dario-Maselli/homelab.git
 BRANCH=main
 
 # Where the deploy copy lives
