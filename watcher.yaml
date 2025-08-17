@@ -1,5 +1,5 @@
 # How often to poll for new commits
-poll_interval_seconds: 30
+poll_interval_seconds: 120
 log_steps: true
 
 notify:

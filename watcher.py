@@ -744,7 +744,7 @@ def main():
         print(line, flush=True)
 
     # load config
-    poll = int(os.environ.get("POLL_INTERVAL_SECONDS", 20))
+    poll = int(os.environ.get("POLL_INTERVAL_SECONDS", 60))
     projects = []
     if cfg_path.exists():
         with open(cfg_path, "r", encoding="utf-8") as f:
